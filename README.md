@@ -1,7 +1,10 @@
 # aarch64linux-image-maker
 
-Script to build bootable Arch Linux ARM `.img.zst` images for Raspberry Pi 5
+Script to build bootable Arch Linux Aarch64 `.img.zst` images for Raspberry Pi 5
 and mainline aarch64 (UEFI/systemd-boot) systems.
+
+## Requirements
+A system already running Arch Linux Aarch64 port
 
 ## Usage
 
