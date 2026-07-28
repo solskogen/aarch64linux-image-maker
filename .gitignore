@@ -1,0 +1,6 @@
+# Build artifacts
+*.img
+*.img.zst
+
+# Downloaded during build, cleaned up on exit
+public.key
