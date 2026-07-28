@@ -48,6 +48,14 @@ if [[ "$ROOT_FS" != "ext4" && "$ROOT_FS" != "btrfs" ]]; then
     exit 1
 fi
 
+# Detect host architecture for cross-compilation support
+HOST_ARCH=$(uname -m)
+CROSS_BUILD=false
+if [[ "$HOST_ARCH" != "aarch64" ]]; then
+    CROSS_BUILD=true
+    echo "Host architecture: $HOST_ARCH — will cross-build aarch64 images using QEMU"
+fi
+
 # Check if running as root
 if [[ $EUID -ne 0 ]]; then
    echo "ERROR: This script must be run as root"
@@ -69,6 +77,12 @@ declare -A REQUIRED_COMMAND_PACKAGES=(
     [mkfs.ext4]=e2fsprogs
     [mkfs.btrfs]=btrfs-progs
 )
+
+# Add QEMU dependencies for cross-building
+if $CROSS_BUILD; then
+    REQUIRED_COMMAND_PACKAGES[qemu-aarch64-static]=qemu-user-static
+fi
+
 MISSING_PACKAGES=()
 declare -A SEEN_PACKAGES=()
 for cmd in "${!REQUIRED_COMMAND_PACKAGES[@]}"; do
@@ -80,14 +94,58 @@ for cmd in "${!REQUIRED_COMMAND_PACKAGES[@]}"; do
         fi
     fi
 done
+
+# Also ensure binfmt package is installed for cross-building
+if $CROSS_BUILD && ! pacman -Qi qemu-user-static-binfmt >/dev/null 2>&1; then
+    if [[ -z "${SEEN_PACKAGES[qemu-user-static-binfmt]:-}" ]]; then
+        MISSING_PACKAGES+=("qemu-user-static-binfmt")
+        SEEN_PACKAGES[qemu-user-static-binfmt]=1
+    fi
+fi
+
 if (( ${#MISSING_PACKAGES[@]} > 0 )); then
     echo "Installing missing packages: ${MISSING_PACKAGES[*]}"
-    # Download repository key once for both host and image
-    wget --timeout=30 -O "$(pwd)/public.key" https://arch-linux-repo.drzee.net/arch/extra/os/aarch64/public.key
-    pacman-key --add "$(pwd)/public.key"
-    pacman-key --lsign-key 0CF25682E6BA0751
     pacman -Sy --needed --noconfirm "${MISSING_PACKAGES[@]}"
 fi
+
+# Import repository signing key into host keyring (needed for pacstrap)
+echo "Importing repository signing key..."
+wget --timeout=30 -qO "$(pwd)/public.key" https://arch-linux-repo.drzee.net/arch/extra/os/aarch64/public.key
+pacman-key --add "$(pwd)/public.key" 2>/dev/null || true
+pacman-key --lsign-key 0CF25682E6BA0751 2>/dev/null || true
+
+# Set up QEMU user-mode emulation for cross-building
+if $CROSS_BUILD; then
+    echo "Setting up QEMU aarch64 emulation..."
+    systemctl restart systemd-binfmt 2>/dev/null || true
+    if [[ ! -f /proc/sys/fs/binfmt_misc/qemu-aarch64 ]]; then
+        echo "ERROR: QEMU aarch64 binfmt_misc registration failed"
+        echo "Ensure binfmt_misc support is enabled in your kernel"
+        exit 1
+    fi
+    echo "QEMU aarch64 emulation is active"
+fi
+
+# Create custom pacman.conf for aarch64 target packages
+PACMAN_CONF=$(mktemp)
+cat > "$PACMAN_CONF" << 'CONFEOF'
+[options]
+HoldPkg = pacman glibc
+Architecture = aarch64
+CheckSpace
+SigLevel = Required DatabaseOptional
+LocalFileSigLevel = Optional
+ParallelDownloads = 5
+
+[forge]
+Server = https://arch-linux-repo.drzee.net/arch/$repo/os/$arch
+
+[core]
+Server = https://arch-linux-repo.drzee.net/arch/$repo/os/$arch
+
+[extra]
+Server = https://arch-linux-repo.drzee.net/arch/$repo/os/$arch
+CONFEOF
 
 # Configuration
 MNT=$(mktemp -d)
@@ -155,6 +213,9 @@ cleanup() {
 
     # Remove leftover repository key
     rm -f "$(pwd)/public.key"
+
+    # Remove temporary pacman config
+    [[ -n "${PACMAN_CONF:-}" ]] && rm -f "$PACMAN_CONF"
 }
 
 # Set up cleanup trap
@@ -282,7 +343,7 @@ install_base_system() {
     local MNT_DIR=$1
     
     echo "Installing base system..."
-    if ! pacstrap -cP "$MNT_DIR" base vim btrfs-progs dosfstools arch-install-scripts linux-firmware mkinitcpio; then
+    if ! pacstrap -c -C "$PACMAN_CONF" "$MNT_DIR" base vim btrfs-progs dosfstools arch-install-scripts linux-firmware mkinitcpio; then
         echo "ERROR: pacstrap install failed"
         exit 1
     fi
@@ -297,6 +358,26 @@ configure_base_system() {
     
     echo "Configuring base system..."
     
+    # Configure target pacman.conf with custom repositories
+    cat > "$MNT_DIR/etc/pacman.conf" << 'CONFEOF'
+[options]
+HoldPkg = pacman glibc
+Architecture = auto
+CheckSpace
+SigLevel = Required DatabaseOptional
+LocalFileSigLevel = Optional
+ParallelDownloads = 5
+
+[forge]
+Server = https://arch-linux-repo.drzee.net/arch/$repo/os/$arch
+
+[core]
+Server = https://arch-linux-repo.drzee.net/arch/$repo/os/$arch
+
+[extra]
+Server = https://arch-linux-repo.drzee.net/arch/$repo/os/$arch
+CONFEOF
+
     # Network configuration
     rm "$MNT_DIR/etc/resolv.conf"
     ln -s /run/systemd/resolve/stub-resolv.conf "$MNT_DIR/etc/resolv.conf"

@@ -4,7 +4,7 @@ Script to build bootable Arch Linux Aarch64 `.img.zst` images for Raspberry Pi 5
 and mainline aarch64 (UEFI/systemd-boot) systems.
 
 ## Requirements
-A system already running Arch Linux Aarch64 port
+A system running Arch Linux (either aarch64 or x86_64) 
 
 ## Usage
 
