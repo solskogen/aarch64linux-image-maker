@@ -591,7 +591,7 @@ for build_type in "${BUILDS[@]}"; do
     TARGET_IMG="$OUTPUT_DIR/archlinux-${build_type}-${BUILD_DATE}-aarch64.img"
     CURRENT_TARGET_IMG="$TARGET_IMG"
     echo "Cloning to ${TARGET_IMG}..."
-    cp --sparse=always "$BASE_IMG" "$TARGET_IMG"
+    cp --reflink=auto --sparse=always "$BASE_IMG" "$TARGET_IMG"
 done
 
 # Step 5: Customize each cloned image
@@ -619,11 +619,11 @@ for build_type in "${BUILDS[@]}"; do
     # Install kernel and configure boot
     if [[ "$build_type" == "rpi" ]]; then
         echo "Installing linux-rpi5 kernel..."
-        arch-chroot "$MNT" pacman -S linux-rpi5 --noconfirm --disable-sandbox || { echo "ERROR: Failed to install linux-rpi5 kernel"; exit 1; }
+        pacstrap -c -C "$PACMAN_CONF" "$MNT" linux-rpi5 || { echo "ERROR: Failed to install linux-rpi5 kernel"; exit 1; }
         configure_boot rpi "$PARTUUID" "$MNT" || { echo "ERROR: Failed to configure rpi boot"; exit 1; }
     else
         echo "Installing linux kernel..."
-        arch-chroot "$MNT" pacman -S linux --noconfirm --disable-sandbox || { echo "ERROR: Failed to install linux kernel"; exit 1; }
+        pacstrap -c -C "$PACMAN_CONF" "$MNT" linux || { echo "ERROR: Failed to install linux kernel"; exit 1; }
         configure_boot mainline "$PARTUUID" "$MNT" || { echo "ERROR: Failed to configure mainline boot"; exit 1; }
     fi
 
