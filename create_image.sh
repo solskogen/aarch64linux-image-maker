@@ -71,7 +71,7 @@ declare -A REQUIRED_COMMAND_PACKAGES=(
     [wget]=wget
     [zstd]=zstd
     [jq]=jq
-    [sfdisk]=gptfdisk
+    [sfdisk]=util-linux
     [sgdisk]=gptfdisk
     [mkfs.vfat]=dosfstools
     [mkfs.ext4]=e2fsprogs
@@ -108,11 +108,15 @@ if (( ${#MISSING_PACKAGES[@]} > 0 )); then
     pacman -Sy --needed --noconfirm "${MISSING_PACKAGES[@]}"
 fi
 
+# Repository configuration (single source of truth for the custom aarch64 repo)
+REPO_BASE_URL="https://arch-linux-repo.drzee.net/arch"
+REPO_SIGNING_KEY="0CF25682E6BA0751"
+
 # Import repository signing key into host keyring (needed for pacstrap)
 echo "Importing repository signing key..."
-wget --timeout=30 -qO "$(pwd)/public.key" https://arch-linux-repo.drzee.net/arch/extra/os/aarch64/public.key || { echo "ERROR: Failed to download repository signing key"; exit 1; }
+wget --timeout=30 -qO "$(pwd)/public.key" "$REPO_BASE_URL/extra/os/aarch64/public.key" || { echo "ERROR: Failed to download repository signing key"; exit 1; }
 pacman-key --add "$(pwd)/public.key" || { echo "ERROR: Failed to import repository signing key"; exit 1; }
-pacman-key --lsign-key 0CF25682E6BA0751 || { echo "ERROR: Failed to locally sign repository key"; exit 1; }
+pacman-key --lsign-key "$REPO_SIGNING_KEY" || { echo "ERROR: Failed to locally sign repository key"; exit 1; }
 
 # Set up QEMU user-mode emulation for cross-building
 if $CROSS_BUILD; then
@@ -128,7 +132,7 @@ fi
 
 # Create custom pacman.conf for aarch64 target packages
 PACMAN_CONF=$(mktemp)
-cat > "$PACMAN_CONF" << 'CONFEOF'
+cat > "$PACMAN_CONF" << CONFEOF
 [options]
 HoldPkg = pacman glibc
 Architecture = aarch64
@@ -138,13 +142,13 @@ LocalFileSigLevel = Optional
 ParallelDownloads = 5
 
 [forge]
-Server = https://arch-linux-repo.drzee.net/arch/$repo/os/$arch
+Server = $REPO_BASE_URL/\$repo/os/\$arch
 
 [core]
-Server = https://arch-linux-repo.drzee.net/arch/$repo/os/$arch
+Server = $REPO_BASE_URL/\$repo/os/\$arch
 
 [extra]
-Server = https://arch-linux-repo.drzee.net/arch/$repo/os/$arch
+Server = $REPO_BASE_URL/\$repo/os/\$arch
 CONFEOF
 
 # Configuration
@@ -157,35 +161,6 @@ BASE_LOOP_NAME=""
 CURRENT_LOOP_NAME=""
 CURRENT_TARGET_IMG=""
 CURRENT_OUTPUT_FILE=""
-
-# Determine which images to build
-if [[ "$TARGET_TYPE" != "rpi" && "$TARGET_TYPE" != "mainline" && "$TARGET_TYPE" != "" ]]; then
-    usage
-    exit 1
-fi
-
-# Create output directory if it doesn't exist
-mkdir -p "$OUTPUT_DIR"
-
-BASE_IMG="$OUTPUT_DIR/aarch64linux-base.img"
-
-if [[ "$TARGET_TYPE" == "rpi" ]]; then
-    BUILDS=("rpi")
-elif [[ "$TARGET_TYPE" == "mainline" ]]; then
-    BUILDS=("mainline")
-else
-    BUILDS=("rpi" "mainline") # Build both by default
-fi
-
-# Preflight disk space check: base image + one raw clone per target must fit,
-# with some headroom for the compressed .zst output created alongside a clone.
-IMG_SIZE_MB=${IMG_SIZE%M}
-REQUIRED_MB=$(( IMG_SIZE_MB * (${#BUILDS[@]} + 1) + IMG_SIZE_MB / 2 ))
-AVAILABLE_MB=$(df --output=avail -BM "$OUTPUT_DIR" | tail -1 | tr -dc '0-9')
-if [ -n "$AVAILABLE_MB" ] && [ "$AVAILABLE_MB" -lt "$REQUIRED_MB" ]; then
-    echo "ERROR: Not enough space in $OUTPUT_DIR (need ~${REQUIRED_MB}M, have ${AVAILABLE_MB}M)"
-    exit 1
-fi
 
 # Cleanup function for exit/failure/interrupt
 cleanup() {
@@ -232,6 +207,49 @@ cleanup() {
 
 # Set up cleanup trap
 trap cleanup EXIT INT TERM
+
+# Determine which images to build
+if [[ "$TARGET_TYPE" != "rpi" && "$TARGET_TYPE" != "mainline" && "$TARGET_TYPE" != "" ]]; then
+    usage
+    exit 1
+fi
+
+# Create output directory if it doesn't exist
+mkdir -p "$OUTPUT_DIR"
+
+BASE_IMG="$OUTPUT_DIR/aarch64linux-base.img"
+
+if [[ "$TARGET_TYPE" == "rpi" ]]; then
+    BUILDS=("rpi")
+elif [[ "$TARGET_TYPE" == "mainline" ]]; then
+    BUILDS=("mainline")
+else
+    BUILDS=("rpi" "mainline") # Build both by default
+fi
+
+# Preflight disk space check: base image + one raw clone per target must fit,
+# with some headroom for the compressed .zst output created alongside a clone.
+IMG_SIZE_MB=${IMG_SIZE%M}
+REQUIRED_MB=$(( IMG_SIZE_MB * (${#BUILDS[@]} + 1) + IMG_SIZE_MB / 2 ))
+AVAILABLE_MB=$(df --output=avail -BM "$OUTPUT_DIR" | tail -1 | tr -dc '0-9')
+if [ -n "$AVAILABLE_MB" ] && [ "$AVAILABLE_MB" -lt "$REQUIRED_MB" ]; then
+    echo "ERROR: Not enough space in $OUTPUT_DIR (need ~${REQUIRED_MB}M, have ${AVAILABLE_MB}M)"
+    exit 1
+fi
+
+# Preflight: confirm before overwriting any pre-existing output image. Checked
+# upfront (before any build work starts) so a "no" doesn't waste a full build.
+for build_type in "${BUILDS[@]}"; do
+    EXISTING_OUTPUT="$OUTPUT_DIR/archlinux-${build_type}-${BUILD_DATE}-aarch64.img.zst"
+    if [ -e "$EXISTING_OUTPUT" ]; then
+        CONFIRM_OVERWRITE=""
+        read -r -p "Output file $EXISTING_OUTPUT already exists. Overwrite? [y/N] " CONFIRM_OVERWRITE || true
+        case "$CONFIRM_OVERWRITE" in
+            [yY]|[yY][eE][sS]) ;;
+            *) echo "ERROR: Aborting: $EXISTING_OUTPUT already exists and overwrite was declined."; exit 1 ;;
+        esac
+    fi
+done
 
 # Function to mount existing image without reformatting
 mount_existing_image() {
@@ -359,7 +377,7 @@ install_base_system() {
     local MNT_DIR=$1
     
     echo "Installing base system..."
-    if ! pacstrap -c -C "$PACMAN_CONF" "$MNT_DIR" base vim btrfs-progs dosfstools arch-install-scripts linux-firmware mkinitcpio; then
+    if ! pacstrap -c -C "$PACMAN_CONF" "$MNT_DIR" base vim btrfs-progs dosfstools e2fsprogs arch-install-scripts linux-firmware mkinitcpio; then
         echo "ERROR: pacstrap install failed"
         exit 1
     fi
@@ -373,26 +391,9 @@ configure_base_system() {
     local MNT_DIR=$1
     
     echo "Configuring base system..."
-    
-    # Configure target pacman.conf with custom repositories
-    cat > "$MNT_DIR/etc/pacman.conf" << 'CONFEOF'
-[options]
-HoldPkg = pacman glibc
-Architecture = auto
-CheckSpace
-SigLevel = Required DatabaseOptional
-LocalFileSigLevel = Optional
-ParallelDownloads = 5
 
-[forge]
-Server = https://arch-linux-repo.drzee.net/arch/$repo/os/$arch
-
-[core]
-Server = https://arch-linux-repo.drzee.net/arch/$repo/os/$arch
-
-[extra]
-Server = https://arch-linux-repo.drzee.net/arch/$repo/os/$arch
-CONFEOF
+    # /etc/pacman.conf inside the image is provided by our own pacman package
+    # (installed via pacstrap) and is left completely untouched.
 
     # Network configuration
     rm "$MNT_DIR/etc/resolv.conf"
@@ -415,13 +416,13 @@ EOF
 
     # Install repository public key (reuse downloaded key if available)
     if [ ! -f "$(pwd)/public.key" ]; then
-        wget --timeout=30 -O "$(pwd)/public.key" https://arch-linux-repo.drzee.net/arch/extra/os/aarch64/public.key
+        wget --timeout=30 -O "$(pwd)/public.key" "$REPO_BASE_URL/extra/os/aarch64/public.key"
     fi
     cp "$(pwd)/public.key" "$MNT_DIR/root/"
     arch-chroot "$MNT_DIR" pacman-key --init
     arch-chroot "$MNT_DIR" pacman-key --populate
     arch-chroot "$MNT_DIR" pacman-key --add /root/public.key
-    arch-chroot "$MNT_DIR" pacman-key --lsign-key 0CF25682E6BA0751
+    arch-chroot "$MNT_DIR" pacman-key --lsign-key "$REPO_SIGNING_KEY"
     rm "$(pwd)/public.key"
 
     # Create README file (resize instructions depend on the root filesystem type)
@@ -454,7 +455,7 @@ STEPEOF
         cat <<EOF
 # How to Expand the Root Filesystem to Match Your Media (GPT Images)
 
-Once you have flashed the '.img.zst' file to your SD card or SSD (e.g., using \`dd\` or Raspberry Pi Imager), the image will only use ~2GB of space. To use the entire capacity of your media, follow these steps while running the installed system (either through SSH or a local console).
+Once you have flashed the '.img.zst' file to your SD card or SSD (e.g., using \`dd\` or Raspberry Pi Imager), the image will only use ~2GB of space. To use the entire capacity of your media, follow these steps while running the installed system.
 
 This image's root filesystem is: $ROOT_FS
 
@@ -618,11 +619,11 @@ for build_type in "${BUILDS[@]}"; do
     # Install kernel and configure boot
     if [[ "$build_type" == "rpi" ]]; then
         echo "Installing linux-rpi5 kernel..."
-        arch-chroot "$MNT" pacman -S linux-rpi5 --noconfirm || { echo "ERROR: Failed to install linux-rpi5 kernel"; exit 1; }
+        arch-chroot "$MNT" pacman -S linux-rpi5 --noconfirm --disable-sandbox || { echo "ERROR: Failed to install linux-rpi5 kernel"; exit 1; }
         configure_boot rpi "$PARTUUID" "$MNT" || { echo "ERROR: Failed to configure rpi boot"; exit 1; }
     else
         echo "Installing linux kernel..."
-        arch-chroot "$MNT" pacman -S linux --noconfirm || { echo "ERROR: Failed to install linux kernel"; exit 1; }
+        arch-chroot "$MNT" pacman -S linux --noconfirm --disable-sandbox || { echo "ERROR: Failed to install linux kernel"; exit 1; }
         configure_boot mainline "$PARTUUID" "$MNT" || { echo "ERROR: Failed to configure mainline boot"; exit 1; }
     fi
 
