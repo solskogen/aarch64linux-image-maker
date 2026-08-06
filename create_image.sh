@@ -110,9 +110,9 @@ fi
 
 # Import repository signing key into host keyring (needed for pacstrap)
 echo "Importing repository signing key..."
-wget --timeout=30 -qO "$(pwd)/public.key" https://arch-linux-repo.drzee.net/arch/extra/os/aarch64/public.key
-pacman-key --add "$(pwd)/public.key" 2>/dev/null || true
-pacman-key --lsign-key 0CF25682E6BA0751 2>/dev/null || true
+wget --timeout=30 -qO "$(pwd)/public.key" https://arch-linux-repo.drzee.net/arch/extra/os/aarch64/public.key || { echo "ERROR: Failed to download repository signing key"; exit 1; }
+pacman-key --add "$(pwd)/public.key" || { echo "ERROR: Failed to import repository signing key"; exit 1; }
+pacman-key --lsign-key 0CF25682E6BA0751 || { echo "ERROR: Failed to locally sign repository key"; exit 1; }
 
 # Set up QEMU user-mode emulation for cross-building
 if $CROSS_BUILD; then
@@ -156,6 +156,7 @@ BUILD_DATE=$(date +%Y.%m.%d)
 BASE_LOOP_NAME=""
 CURRENT_LOOP_NAME=""
 CURRENT_TARGET_IMG=""
+CURRENT_OUTPUT_FILE=""
 
 # Determine which images to build
 if [[ "$TARGET_TYPE" != "rpi" && "$TARGET_TYPE" != "mainline" && "$TARGET_TYPE" != "" ]]; then
@@ -211,6 +212,17 @@ cleanup() {
         kpartx -dv "$CURRENT_TARGET_IMG" 2>/dev/null || true
     fi
 
+    # Remove incomplete image/compressed output left behind by an interrupted run.
+    # These are only cleared (see below) once they reach a known-good final state.
+    if [ -n "$CURRENT_TARGET_IMG" ] && [ -f "$CURRENT_TARGET_IMG" ]; then
+        echo "Removing incomplete image $CURRENT_TARGET_IMG..."
+        rm -f "$CURRENT_TARGET_IMG"
+    fi
+    if [ -n "$CURRENT_OUTPUT_FILE" ] && [ -f "$CURRENT_OUTPUT_FILE" ]; then
+        echo "Removing incomplete compressed output $CURRENT_OUTPUT_FILE..."
+        rm -f "$CURRENT_OUTPUT_FILE"
+    fi
+
     # Remove leftover repository key
     rm -f "$(pwd)/public.key"
 
@@ -229,8 +241,10 @@ mount_existing_image() {
     [ -f "$IMG" ] || { echo "ERROR: Image file $IMG does not exist"; return 1; }
 
     # Create loop device mappings
-    local KPARTX_OUTPUT=$(kpartx -av "$IMG")
-    local LOOP_NAME=$(echo "$KPARTX_OUTPUT" | head -1 | awk '{print $3}' | sed 's/p[0-9]*$//')
+    local KPARTX_OUTPUT
+    KPARTX_OUTPUT=$(kpartx -av "$IMG")
+    local LOOP_NAME
+    LOOP_NAME=$(echo "$KPARTX_OUTPUT" | head -1 | awk '{print $3}' | sed 's/p[0-9]*$//')
     
     [ -n "$LOOP_NAME" ] || { echo "ERROR: Failed to extract loop device name" >&2; return 1; }
     
@@ -270,8 +284,10 @@ EOF
     fi
 
     # Create loop device mappings
-    local KPARTX_OUTPUT=$(kpartx -av "$IMG")
-    local LOOP_NAME=$(echo "$KPARTX_OUTPUT" | head -1 | awk '{print $3}' | sed 's/p[0-9]*$//')
+    local KPARTX_OUTPUT
+    KPARTX_OUTPUT=$(kpartx -av "$IMG")
+    local LOOP_NAME
+    LOOP_NAME=$(echo "$KPARTX_OUTPUT" | head -1 | awk '{print $3}' | sed 's/p[0-9]*$//')
     
     [ -n "$LOOP_NAME" ] || { echo "ERROR: Failed to extract loop device name" >&2; return 1; }
     
@@ -572,6 +588,7 @@ echo
 echo "--- Cloning base images ---"
 for build_type in "${BUILDS[@]}"; do
     TARGET_IMG="$OUTPUT_DIR/archlinux-${build_type}-${BUILD_DATE}-aarch64.img"
+    CURRENT_TARGET_IMG="$TARGET_IMG"
     echo "Cloning to ${TARGET_IMG}..."
     cp --sparse=always "$BASE_IMG" "$TARGET_IMG"
 done
@@ -590,7 +607,10 @@ for build_type in "${BUILDS[@]}"; do
     # Verify mount
     [ -f "$MNT/etc/pacman.conf" ] || { echo "ERROR: Cloned system not properly mounted"; exit 1; }
     [ -d "$MNT/proc" ] || { echo "ERROR: /proc directory missing in cloned system"; exit 1; }
-    [ -d "$MNT" ] && mountpoint -q "$MNT" || { echo "ERROR: Mount point not valid"; exit 1; }
+    if ! { [ -d "$MNT" ] && mountpoint -q "$MNT"; }; then
+        echo "ERROR: Mount point not valid"
+        exit 1
+    fi
     
     # Get partition UUID
     PARTUUID=$(get_partition_uuid "$CURRENT_TARGET_IMG" "$CURRENT_LOOP_NAME")
@@ -614,12 +634,14 @@ for build_type in "${BUILDS[@]}"; do
     umount "$MNT"
     kpartx -dv "$TARGET_IMG"
     CURRENT_LOOP_NAME=""
-    CURRENT_TARGET_IMG=""
     
     echo "Compressing ${build_type} image..."
     OUTPUT_FILE="$OUTPUT_DIR/archlinux-${build_type}-${BUILD_DATE}-aarch64.img.zst"
-    zstd -9 -T0 "$TARGET_IMG" -o "$OUTPUT_FILE"
+    CURRENT_OUTPUT_FILE="$OUTPUT_FILE"
+    zstd -f -9 -T0 "$TARGET_IMG" -o "$OUTPUT_FILE"
+    CURRENT_OUTPUT_FILE=""
     rm "$TARGET_IMG"
+    CURRENT_TARGET_IMG=""
     echo "Created: ${OUTPUT_FILE}"
 done
 
