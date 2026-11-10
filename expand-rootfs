@@ -1,0 +1,53 @@
+#!/bin/bash
+# expand-rootfs - grow the root partition and its filesystem to fill the whole disk.
+# Installed into the image as /usr/local/bin/expand-rootfs; see /README_RESIZE.txt.
+set -euo pipefail
+
+die() {
+    echo "ERROR: $*" >&2
+    exit 1
+}
+
+[[ $EUID -eq 0 ]] || die "run this as root"
+
+src=$(findmnt -n -o SOURCE -T /)
+src=${src%%\[*}   # btrfs reports e.g. /dev/sda2[/subvol]
+[[ -b $src ]] || die "cannot determine the root block device (got '$src'); use the manual steps in /README_RESIZE.txt"
+fstype=$(findmnt -n -o FSTYPE -T /)
+
+partfile="/sys/class/block/${src##*/}/partition"
+[[ -r $partfile ]] || die "$src is not a partition; use the manual steps in /README_RESIZE.txt"
+partnum=$(<"$partfile")
+disk="/dev/$(lsblk -no PKNAME "$src" | head -n 1)"
+[[ -b $disk ]] || die "cannot determine the disk that holds $src"
+
+# Growing is only safe (and only useful) for the last partition on the disk
+last=$(sfdisk -l -o Device "$disk" | tail -n 1)
+[[ $last == "$src" ]] || die "$src is not the last partition on $disk; refusing to resize"
+
+echo "Root filesystem: $src ($fstype), partition $partnum of $disk"
+echo
+echo "Before:"
+df -h /
+echo
+
+echo "Growing partition $partnum to fill $disk..."
+echo "(sfdisk saying it could not re-read the partition table is expected while the disk is in use; partx handles it.)"
+echo ', +' | sfdisk --no-reread -N "$partnum" "$disk"
+partx -u "$disk" 2>/dev/null || true
+udevadm settle
+echo
+
+echo "Growing the $fstype filesystem..."
+case $fstype in
+    ext4) resize2fs "$src" ;;
+    btrfs) btrfs filesystem resize max / ;;
+    *) die "unsupported filesystem '$fstype'" ;;
+esac
+echo
+
+echo "After:"
+df -h /
+
+# Nothing left to do once it has succeeded, so remove the helper
+rm -f -- "$(readlink -f "$0")"
